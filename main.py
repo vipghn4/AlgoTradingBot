@@ -18,21 +18,20 @@ data_provider = YFinanceDataProvider(start='2015-01-01')
 qqq_data = data_provider.get_data(['QQQ'])
 rf_rate = get_market_risk_free_rate()
 
-# 2. Shared Backtester Configuration (Realistic Broker Setup: e.g., IBKR Tiered pricing)
+# 2. Shared Backtester Configuration (UK Trader trading US Stocks: GIA with 0.35% FX fee & 20% CGT)
 common_params = {
     'data': qqq_data,
     'initial_capital': 5000.0,
     'monthly_deposit': 1500.0,
-    'commission_per_share': 0.0035,
-    'commission_min': 0.35,
-    'tax_rate': 0.15,
-    'tax_deferred': True,
-    'allow_margin': False,
-    'allow_short': False,
-    'allow_fractional': False,
-    'slippage_pct': 0.0005,
-    'execution_delay': 1,
-    'execution_price_type': 'Open'
+    'commission_pct': 0.0035,  # 0.35% FX conversion fee on USD assets
+    'tax_rate': 0.20,           # 20% UK Capital Gains Tax (Higher-rate band)
+    'tax_deferred': True,       # Taxes settled annually at tax year-end
+    'allow_margin': False,      # Cash account (no leverage/borrowing)
+    'allow_short': False,       # Short selling disabled
+    'allow_fractional': True,   # Fractional shares enabled
+    'slippage_pct': 0.0005,     # 0.05% bid-ask execution spread
+    'execution_delay': 1,       # 1-day execution delay
+    'execution_price_type': 'Open' # Execute at next US market open
 }
 
 # 3. Define Strategies to compare
