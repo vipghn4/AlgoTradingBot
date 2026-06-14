@@ -34,9 +34,9 @@ class PerformanceAnalyzer:
         print(pd.Series(self.metrics))
 
     def _get_return_metrics(self, df: pd.DataFrame) -> dict:
-        total_ret = (df['total_equity'].iloc[-1] / df['total_equity'].iloc[0]) - 1
+        total_ret = (df['returns'] + 1.0).prod() - 1.0
         days = (df.index[-1] - df.index[0]).days
-        cagr = ((1 + total_ret) ** (365.25 / days)) - 1 if days > 0 else 0
+        cagr = ((1.0 + total_ret) ** (365.25 / days)) - 1.0 if days > 0 else 0.0
         return {"Total Return": f"{total_ret:.2%}", "CAGR": f"{cagr:.2%}"}
 
     def _get_risk_metrics(self, df: pd.DataFrame) -> dict:
