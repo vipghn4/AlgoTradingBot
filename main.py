@@ -18,13 +18,21 @@ data_provider = YFinanceDataProvider(start='2015-01-01')
 qqq_data = data_provider.get_data(['QQQ'])
 rf_rate = get_market_risk_free_rate()
 
-# 2. Shared Backtester Configuration
+# 2. Shared Backtester Configuration (Realistic Broker Setup: e.g., IBKR Tiered pricing)
 common_params = {
     'data': qqq_data,
     'initial_capital': 5000.0,
     'monthly_deposit': 1500.0,
-    'annual_margin_rate': 0.08,
-    'tax_rate': 0.20
+    'commission_per_share': 0.0035,
+    'commission_min': 0.35,
+    'tax_rate': 0.15,
+    'tax_deferred': True,
+    'allow_margin': False,
+    'allow_short': False,
+    'allow_fractional': False,
+    'slippage_pct': 0.0005,
+    'execution_delay': 1,
+    'execution_price_type': 'Open'
 }
 
 # 3. Define Strategies to compare
