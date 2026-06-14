@@ -164,3 +164,6 @@ Minimize human resources required to build and maintain the system by creating a
    - Classes should have a small number of instance variables. Each method of the class should manipulate one or more of those variables.
    - High cohesion means that the methods and variables of the class are co-dependent and hang together as a logical whole.
 - **Organize for change (open-closed principle)**: Classes should be structured so that you can add new features by extending the system, not by modifying existing code.
+
+## AlgoTradingBot-specific principles
+- Use coincise comments to make financial concepts easy to follow.

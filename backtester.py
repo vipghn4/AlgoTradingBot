@@ -292,7 +292,7 @@ class Backtester:
                       tickers: List[str], days_elapsed: int, rate: float) -> float:
         """Processes daily transactions (sells first, then buys) and returns portfolio valuation in USD."""
                       
-        # 1. Apply daily short borrow fees on all existing short positions
+        # Apply overnight borrowing fees on short positions using previous Close to prevent lookahead bias
         for ticker_idx in range(len(tickers)):
             if state.holdings[ticker_idx] < 0.0:
                 price_idx = date_idx - 1 if date_idx > 0 else 0
@@ -336,7 +336,7 @@ class Backtester:
             qty_close = -old_h
             qty_open = new_h
             
-            # Pro-rate transaction commissions to prevent double counting
+            # Position flips are split so closing (risk-reducing) trades bypass margin clamps
             total_comm = self.commission_model.calculate(qty, price_eff)
             comm_close = total_comm * (abs(qty_close) / abs(qty))
             comm_open = total_comm * (abs(qty_open) / abs(qty))
