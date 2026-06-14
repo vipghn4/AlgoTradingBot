@@ -98,22 +98,40 @@ class Backtester:
             slippage_model: Optional custom SlippageModel policy implementation.
             tax_model: Optional custom TaxModel policy implementation.
         """
-        if not isinstance(data.columns, pd.MultiIndex):
-            raise ValueError("Data columns must be a MultiIndex DataFrame with levels (Ticker, Price)")
-            
+        self._validate_inputs(data, max_leverage, maintenance_margin_pct, execution_delay, execution_price_type)
         self.data = data.sort_index()
         self.strategy = strategy
+        self.fx_pct = fx_pct
+        self.fx_rates = fx_rates if fx_rates is not None else pd.Series(deposit_fx_rate, index=data.index)
         
-        # Enforce validation checks on inputs
+        self.config = self._create_config(
+            initial_capital, monthly_deposit, annual_margin_rate, annual_borrow_rate,
+            allow_margin, max_leverage, maintenance_margin_pct, allow_short,
+            allow_fractional, execution_delay, execution_price_type, deposit_fx_rate,
+            account_currency, deposit_currency
+        )
+        self._init_models(
+            commission_model, commission_per_share, commission_pct, commission_flat, commission_min,
+            slippage_model, slippage_pct, tax_model, tax_rate, tax_deferred, account_currency, fx_pct
+        )
+
+    def _validate_inputs(self, data: pd.DataFrame, max_leverage: float, maintenance_margin_pct: float,
+                         execution_delay: int, execution_price_type: str):
+        if not isinstance(data.columns, pd.MultiIndex):
+            raise ValueError("Data columns must be a MultiIndex DataFrame with levels (Ticker, Price)")
         if max_leverage < 1.0:
             raise ValueError("max_leverage must be at least 1.0")
         if maintenance_margin_pct < 0.0 or maintenance_margin_pct >= 1.0:
             raise ValueError("maintenance_margin_pct must be between 0.0 and 1.0")
         if execution_delay == 0 and execution_price_type == 'Open':
             raise ValueError("execution_delay cannot be 0 when execution_price_type is 'Open' due to lookahead bias risk.")
-            
-        # Group configuration parameters
-        self.config = BacktesterConfig(
+
+    def _create_config(self, initial_capital: float, monthly_deposit: float, annual_margin_rate: float,
+                       annual_borrow_rate: float, allow_margin: bool, max_leverage: float,
+                       maintenance_margin_pct: float, allow_short: bool, allow_fractional: bool,
+                       execution_delay: int, execution_price_type: str, deposit_fx_rate: float,
+                       account_currency: str, deposit_currency: str) -> BacktesterConfig:
+        return BacktesterConfig(
             initial_capital=initial_capital,
             monthly_deposit=monthly_deposit,
             margin_rate_daily=annual_margin_rate / 360.0,
@@ -129,13 +147,12 @@ class Backtester:
             account_currency=account_currency,
             deposit_currency=deposit_currency
         )
-        
-        self.fx_pct = fx_pct
-        if fx_rates is None:
-            self.fx_rates = pd.Series(deposit_fx_rate, index=data.index)
-        else:
-            self.fx_rates = fx_rates
-            
+
+    def _init_models(self, commission_model: Optional[CommissionModel], commission_per_share: float,
+                     commission_pct: float, commission_flat: float, commission_min: float,
+                     slippage_model: Optional[SlippageModel], slippage_pct: float,
+                     tax_model: Optional[TaxModel], tax_rate: float, tax_deferred: bool,
+                     account_currency: str, fx_pct: float):
         if commission_model is None:
             comm_fx_pct = 0.0 if account_currency != 'USD' else fx_pct
             self.commission_model = DefaultCommissionModel(
@@ -340,82 +357,82 @@ class Backtester:
             return
             
         original_qty = qty
-        
-        # Use previous Close price to prevent lookahead leaks when verifying margin limits at Open
         val_idx = max(0, date_idx - 1) if self.config.execution_price_type == 'Open' else date_idx
         
-        # Enforce short restrictions
+        qty = self._apply_short_restrictions(ticker_idx, qty, state)
+        if qty == 0.0:
+            return
+            
+        qty = self._apply_margin_clamps(val_idx, ticker_idx, qty, price_eff, state, close_prices_arr, rate)
+        if qty == 0.0:
+            return
+            
+        is_liquidating = math.isclose(qty, -state.holdings[ticker_idx], rel_tol=1e-9, abs_tol=1e-9)
+        qty = self._apply_fractional_rounding(qty, is_liquidating)
+        if qty == 0.0:
+            return
+            
+        if qty != original_qty:
+            comm = self.commission_model.calculate(qty, price_eff)
+            
+        comm_tax = comm if is_liquidating or (state.holdings[ticker_idx] != 0.0 and (state.holdings[ticker_idx] + qty) == 0.0) else 0.0
+        realized_lots = state.update_position(ticker_idx, qty, price_eff, comm, date=self.data.index[date_idx], rate=rate)
+        trade_gain = self.tax_model.calculate_realized_gain(realized_lots, comm_tax, rate)
+        
+        state.realized_gain_loss_ytd += trade_gain
+        tax = self._process_immediate_tax(state)
+        
+        self._deduct_transaction_cost(qty, price_eff, comm, tax, state, rate)
+
+    def _apply_short_restrictions(self, ticker_idx: int, qty: float, state: PortfolioState) -> float:
         if qty < 0.0 and not self.config.allow_short:
             current_holding = state.holdings[ticker_idx]
             if current_holding <= 0.0:
-                qty = 0.0
-            else:
-                qty = max(qty, -current_holding)
-                
-        if qty == 0.0:
-            return
-            
-        # Enforce margin/cash limits for buys
+                return 0.0
+            return max(qty, -current_holding)
+        return qty
+
+    def _apply_margin_clamps(self, val_idx: int, ticker_idx: int, qty: float, price_eff: float,
+                             state: PortfolioState, close_prices_arr: np.ndarray, rate: float) -> float:
         if qty > 0.0:
-            # Bypass margin clamping for buy-to-cover orders (closing short positions)
             if state.holdings[ticker_idx] >= 0.0:
-                qty = self._clamp_buy_quantity(val_idx, ticker_idx, qty, price_eff, state, close_prices_arr, rate)
-            
-        # Enforce margin/cash limits for short entries
+                return self._clamp_buy_quantity(val_idx, ticker_idx, qty, price_eff, state, close_prices_arr, rate)
         elif qty < 0.0 and state.holdings[ticker_idx] <= 0.0:
-            qty = self._clamp_short_quantity(val_idx, qty, price_eff, state, close_prices_arr, rate)
-            
-        # Round to whole shares if fractional trading is disabled, except for full liquidations
-        is_liquidating = math.isclose(qty, -state.holdings[ticker_idx], rel_tol=1e-9, abs_tol=1e-9)
-                         
+            return self._clamp_short_quantity(val_idx, qty, price_eff, state, close_prices_arr, rate)
+        return qty
+
+    def _apply_fractional_rounding(self, qty: float, is_liquidating: bool) -> float:
         if not self.config.allow_fractional and not is_liquidating:
-            qty = float(math.floor(qty)) if qty > 0.0 else float(math.ceil(qty))
-            
-        if qty == 0.0:
-            return
-            
-        # Recalculate transaction fee if quantity was clamped
-        if qty != original_qty:
-            comm = self.commission_model.calculate(qty, price_eff)
-        
-        # Only deduct commission from capital gains on liquidating/reducing trades
-        comm_tax = comm if is_liquidating or (state.holdings[ticker_idx] != 0.0 and (state.holdings[ticker_idx] + qty) == 0.0) else 0.0
-        
-        # Update position in state container using FIFO lot tracking and daily FX rate
-        realized_lots = state.update_position(ticker_idx, qty, price_eff, comm, date=self.data.index[date_idx], rate=rate)
-        
-        # Calculate capital gains tax (returns gain/loss in account currency)
-        trade_gain = self.tax_model.calculate_realized_gain(realized_lots, comm_tax, rate)
-        
-        # Accumulate YTD realized gains (already in account currency)
-        state.realized_gain_loss_ytd += trade_gain
-        
-        # Immediate tax calculation (if not deferred)
+            return float(math.floor(qty)) if qty > 0.0 else float(math.ceil(qty))
+        return qty
+
+    def _process_immediate_tax(self, state: PortfolioState) -> float:
+        if self.tax_model.deferred:
+            return 0.0
         tax = 0.0
-        if not self.tax_model.deferred and state.realized_gain_loss_ytd > 0.0:
+        if state.realized_gain_loss_ytd > 0.0:
             taxable_gain = max(0.0, state.realized_gain_loss_ytd - state.tax_loss_carry_forward)
             state.tax_loss_carry_forward = max(0.0, state.tax_loss_carry_forward - state.realized_gain_loss_ytd)
             tax = taxable_gain * self.tax_model.rate
             state.realized_gain_loss_ytd = 0.0
-        elif not self.tax_model.deferred and state.realized_gain_loss_ytd < 0.0:
+        elif state.realized_gain_loss_ytd < 0.0:
             state.tax_loss_carry_forward += abs(state.realized_gain_loss_ytd)
             state.realized_gain_loss_ytd = 0.0
-            
-        # Convert stock price (USD) and commission (USD) to account currency
+        return tax
+
+    def _deduct_transaction_cost(self, qty: float, price_eff: float, comm: float, tax: float,
+                                 state: PortfolioState, rate: float):
         val_usd = qty * price_eff
         comm_usd = comm
-        
         if self.config.account_currency == 'USD':
             val_account = val_usd
             comm_account = comm_usd
         else:
-            # Apply transactional FX markup if converting
             if qty > 0.0: # Buy
                 val_account = val_usd / (rate * (1.0 - self.fx_pct))
             else: # Sell
                 val_account = val_usd / (rate * (1.0 + self.fx_pct))
             comm_account = comm_usd / rate
-            
         trade_cost_account = val_account + comm_account + tax
         state.cash -= trade_cost_account
 
@@ -470,34 +487,39 @@ class Backtester:
                                   tickers: List[str], rate: float):
         """Verifies account equity is above the maintenance margin and triggers liquidation if breached."""
         if not self.config.allow_margin:
-            # For cash accounts, cash must not stay significantly negative
             if state.cash < -1e-5:
                 self._liquidate_portfolio(date_idx, state, close_prices_arr, tickers, rate)
             return
             
-        # Intraday check using High/Low if available
         if low_prices_arr is not None and high_prices_arr is not None:
-            worst_prices = np.zeros(len(tickers))
-            for j in range(len(tickers)):
-                worst_prices[j] = low_prices_arr[date_idx, j] if state.holdings[j] >= 0.0 else high_prices_arr[date_idx, j]
-            
-            worst_holdings_val = float(np.nansum(state.holdings * worst_prices))
-            worst_equity = state.cash + worst_holdings_val / rate
-            worst_gross_exposure = float(np.nansum(np.abs(state.holdings) * worst_prices)) / rate
-            
-            if worst_gross_exposure > 0.0:
-                margin_ratio = worst_equity / worst_gross_exposure
-                if margin_ratio < self.config.maintenance_margin_pct or worst_equity <= 0.0:
-                    self._liquidate_portfolio(date_idx, state, close_prices_arr, tickers, rate)
+            self._check_intraday_margin(date_idx, state, close_prices_arr, low_prices_arr, high_prices_arr, tickers, rate)
         else:
-            # Close-only fallback
-            equity = state.get_equity(close_prices_arr[date_idx], rate)
-            gross_exposure = state.get_gross_exposure(close_prices_arr[date_idx], rate)
-            
-            if gross_exposure > 0.0:
-                margin_ratio = equity / gross_exposure
-                if margin_ratio < self.config.maintenance_margin_pct or equity <= 0.0:
-                    self._liquidate_portfolio(date_idx, state, close_prices_arr, tickers, rate)
+            self._check_close_margin(date_idx, state, close_prices_arr, tickers, rate)
+
+    def _check_intraday_margin(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray,
+                               low_prices_arr: np.ndarray, high_prices_arr: np.ndarray, tickers: List[str], rate: float):
+        worst_prices = np.zeros(len(tickers))
+        for j in range(len(tickers)):
+            worst_prices[j] = low_prices_arr[date_idx, j] if state.holdings[j] >= 0.0 else high_prices_arr[date_idx, j]
+        
+        worst_holdings_val = float(np.nansum(state.holdings * worst_prices))
+        worst_equity = state.cash + worst_holdings_val / rate
+        worst_gross_exposure = float(np.nansum(np.abs(state.holdings) * worst_prices)) / rate
+        
+        if worst_gross_exposure > 0.0:
+            margin_ratio = worst_equity / worst_gross_exposure
+            if margin_ratio < self.config.maintenance_margin_pct or worst_equity <= 0.0:
+                self._liquidate_portfolio(date_idx, state, close_prices_arr, tickers, rate)
+
+    def _check_close_margin(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray,
+                            tickers: List[str], rate: float):
+        equity = state.get_equity(close_prices_arr[date_idx], rate)
+        gross_exposure = state.get_gross_exposure(close_prices_arr[date_idx], rate)
+        
+        if gross_exposure > 0.0:
+            margin_ratio = equity / gross_exposure
+            if margin_ratio < self.config.maintenance_margin_pct or equity <= 0.0:
+                self._liquidate_portfolio(date_idx, state, close_prices_arr, tickers, rate)
 
     def _liquidate_portfolio(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray, tickers: List[str], rate: float):
         """Forcibly liquidates all open positions at Close prices due to margin call."""
@@ -505,27 +527,32 @@ class Backtester:
         for ticker_idx in range(len(tickers)):
             qty = state.holdings[ticker_idx]
             if qty != 0.0:
-                price = close_prices_arr[date_idx, ticker_idx]
-                if not pd.isna(price) and price > 0.0:
-                    price_eff = self.slippage_model.apply(price, -qty)
-                    comm = self.commission_model.calculate(-qty, price_eff)
-                    
-                    val_usd = qty * price_eff
-                    comm_usd = comm
-                    if self.config.account_currency == 'USD':
-                        val_account = val_usd
-                        comm_account = comm_usd
-                    else:
-                        if qty > 0.0: # Sell long
-                            val_account = val_usd / (rate * (1.0 + self.fx_pct))
-                        else: # Buy to cover short
-                            val_account = val_usd / (rate * (1.0 - self.fx_pct))
-                        comm_account = comm_usd / rate
-                        
-                    state.cash += val_account - comm_account
-                    realized_lots = state.update_position(ticker_idx, -qty, price_eff, comm, date=date, rate=rate)
-                    trade_gain = self.tax_model.calculate_realized_gain(realized_lots, comm, rate)
-                    state.realized_gain_loss_ytd += trade_gain
+                self._liquidate_ticker(date_idx, ticker_idx, qty, date, state, close_prices_arr, rate)
+
+    def _liquidate_ticker(self, date_idx: int, ticker_idx: int, qty: float, date: pd.Timestamp,
+                          state: PortfolioState, close_prices_arr: np.ndarray, rate: float):
+        price = close_prices_arr[date_idx, ticker_idx]
+        if pd.isna(price) or price <= 0.0:
+            return
+            
+        price_eff = self.slippage_model.apply(price, -qty)
+        comm = self.commission_model.calculate(-qty, price_eff)
+        
+        proceeds = self._calculate_liquidation_proceeds(qty, qty * price_eff, comm, rate)
+        state.cash += proceeds
+        
+        realized_lots = state.update_position(ticker_idx, -qty, price_eff, comm, date=date, rate=rate)
+        trade_gain = self.tax_model.calculate_realized_gain(realized_lots, comm, rate)
+        state.realized_gain_loss_ytd += trade_gain
+
+    def _calculate_liquidation_proceeds(self, qty: float, val_usd: float, comm_usd: float, rate: float) -> float:
+        if self.config.account_currency == 'USD':
+            return val_usd - comm_usd
+        if qty > 0.0: # Sell long
+            val_account = val_usd / (rate * (1.0 + self.fx_pct))
+        else: # Buy to cover short
+            val_account = val_usd / (rate * (1.0 - self.fx_pct))
+        return val_account - comm_usd / rate
 
     def _finalize_results(self, cash_hist: np.ndarray, val_hist: np.ndarray, deposit_hist: np.ndarray) -> pd.DataFrame:
         """Formats the simulated historical timelines into a final output DataFrame with net returns."""
