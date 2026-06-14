@@ -8,7 +8,7 @@ from portfolio_state import PortfolioState
 from trading_models import (
     CommissionModel, DefaultCommissionModel,
     SlippageModel, DefaultSlippageModel,
-    TaxModel, DefaultTaxModel
+    TaxModel, DefaultTaxModel, CurrencyConverter
 )
 
 # =====================================================================
@@ -103,6 +103,7 @@ class Backtester:
         self.strategy = strategy
         self.fx_pct = fx_pct
         self.fx_rates = fx_rates if fx_rates is not None else pd.Series(deposit_fx_rate, index=data.index)
+        self.currency_converter = CurrencyConverter(fx_rates=self.fx_rates, fx_pct=fx_pct)
         
         self.config = self._create_config(
             initial_capital, monthly_deposit, annual_margin_rate, annual_borrow_rate,
@@ -112,7 +113,7 @@ class Backtester:
         )
         self._init_models(
             commission_model, commission_per_share, commission_pct, commission_flat, commission_min,
-            slippage_model, slippage_pct, tax_model, tax_rate, tax_deferred, account_currency, fx_pct
+            slippage_model, slippage_pct, tax_model, tax_rate, tax_deferred
         )
 
     def _validate_inputs(self, data: pd.DataFrame, max_leverage: float, maintenance_margin_pct: float,
@@ -151,19 +152,48 @@ class Backtester:
     def _init_models(self, commission_model: Optional[CommissionModel], commission_per_share: float,
                      commission_pct: float, commission_flat: float, commission_min: float,
                      slippage_model: Optional[SlippageModel], slippage_pct: float,
-                     tax_model: Optional[TaxModel], tax_rate: float, tax_deferred: bool,
-                     account_currency: str, fx_pct: float):
+                     tax_model: Optional[TaxModel], tax_rate: float, tax_deferred: bool):
         if commission_model is None:
-            comm_fx_pct = 0.0 if account_currency != 'USD' else fx_pct
             self.commission_model = DefaultCommissionModel(
-                per_share=commission_per_share, pct=commission_pct, flat=commission_flat, minimum=commission_min, fx_pct=comm_fx_pct
+                per_share=commission_per_share, pct=commission_pct, flat=commission_flat, minimum=commission_min
             )
         else:
             self.commission_model = commission_model
-            if hasattr(self.commission_model, 'fx_pct') and account_currency != 'USD':
-                self.commission_model.fx_pct = 0.0
         self.slippage_model = slippage_model or DefaultSlippageModel(pct=slippage_pct)
         self.tax_model = tax_model or DefaultTaxModel(rate=tax_rate, deferred=tax_deferred)
+
+    def _calculate_commission(self, qty: float, price_eff: float) -> float:
+        """Calculates transaction commission including FX fee if the account is in USD."""
+        comm = self.commission_model.calculate(qty, price_eff)
+        if self.config.account_currency == 'USD':
+            comm += abs(qty) * price_eff * self.fx_pct
+        return comm
+
+    def _get_max_qty(self, cash: float, price: float) -> float:
+        """Determines the maximum purchaseable quantity for a given cash limit, incorporating FX markup if USD account."""
+        if not isinstance(self.commission_model, DefaultCommissionModel):
+            return self.commission_model.get_max_qty(cash, price)
+            
+        if cash <= 0.0:
+            return 0.0
+            
+        pct = self.commission_model.pct
+        per_share = self.commission_model.per_share
+        flat = self.commission_model.flat
+        minimum = self.commission_model.minimum
+        
+        fx_pct = self.fx_pct if self.config.account_currency == 'USD' else 0.0
+        
+        price_factor = price * (1.0 + pct + fx_pct) + per_share
+        if price_factor > 0.0:
+            q_candidate = (cash - flat) / price_factor
+            broker_comm_candidate = q_candidate * (price * pct + per_share) + flat
+            if broker_comm_candidate >= minimum:
+                return q_candidate
+            else:
+                denominator = price * (1.0 + fx_pct)
+                return (cash - minimum) / denominator if denominator > 0.0 else 0.0
+        return 0.0
 
     def run(self) -> pd.DataFrame:
         """Executes the backtest simulation over the entire historical dataset."""
@@ -261,13 +291,12 @@ class Backtester:
             is_new_month = False
             
         if is_new_month:
-            if self.config.deposit_currency == self.config.account_currency:
-                converted_deposit = self.config.monthly_deposit
-            else:
-                if self.config.deposit_currency == 'GBP' and self.config.account_currency == 'USD':
-                    converted_deposit = self.config.monthly_deposit * rate * (1.0 - self.fx_pct)
-                else:
-                    converted_deposit = (self.config.monthly_deposit / rate) * (1.0 - self.fx_pct)
+            converted_deposit = self.currency_converter.convert_deposit(
+                self.config.monthly_deposit,
+                self.config.deposit_currency,
+                self.config.account_currency,
+                rate
+            )
             state.cash += converted_deposit
             deposit_made = converted_deposit
             
@@ -337,7 +366,7 @@ class Backtester:
             qty_open = new_h
             
             # Position flips are split so closing (risk-reducing) trades bypass margin clamps
-            total_comm = self.commission_model.calculate(qty, price_eff)
+            total_comm = self._calculate_commission(qty, price_eff)
             comm_close = total_comm * (abs(qty_close) / abs(qty))
             comm_open = total_comm * (abs(qty_open) / abs(qty))
             
@@ -347,7 +376,7 @@ class Backtester:
             # Execute Opening Portion (subject to margin clamps)
             self._process_transaction(date_idx, ticker_idx, qty_open, price_eff, comm_open, state, close_prices_arr, rate)
         else:
-            comm = self.commission_model.calculate(qty, price_eff)
+            comm = self._calculate_commission(qty, price_eff)
             self._process_transaction(date_idx, ticker_idx, qty, price_eff, comm, state, close_prices_arr, rate)
 
     def _process_transaction(self, date_idx: int, ticker_idx: int, qty: float, price_eff: float,
@@ -373,7 +402,7 @@ class Backtester:
             return
             
         if qty != original_qty:
-            comm = self.commission_model.calculate(qty, price_eff)
+            comm = self._calculate_commission(qty, price_eff)
             
         comm_tax = comm if is_liquidating or (state.holdings[ticker_idx] != 0.0 and (state.holdings[ticker_idx] + qty) == 0.0) else 0.0
         realized_lots = state.update_position(ticker_idx, qty, price_eff, comm, date=self.data.index[date_idx], rate=rate)
@@ -428,10 +457,8 @@ class Backtester:
             val_account = val_usd
             comm_account = comm_usd
         else:
-            if qty > 0.0: # Buy
-                val_account = val_usd / (rate * (1.0 - self.fx_pct))
-            else: # Sell
-                val_account = val_usd / (rate * (1.0 + self.fx_pct))
+            is_buy = qty > 0.0
+            val_account = self.currency_converter.convert_trade(val_usd, None, is_buy, rate)
             comm_account = comm_usd / rate
         trade_cost_account = val_account + comm_account + tax
         state.cash -= trade_cost_account
@@ -443,7 +470,7 @@ class Backtester:
         cash_usd = state.cash * rate
         # Account for FX markup on transaction value by adjusting effective price
         price_eff_fx = price_eff / (1.0 - self.fx_pct)
-        max_cash_qty = self.commission_model.get_max_qty(cash_usd, price_eff_fx)
+        max_cash_qty = self._get_max_qty(cash_usd, price_eff_fx)
         
         if self.config.allow_margin:
             # Leverage limits computed in account currency
@@ -454,7 +481,7 @@ class Backtester:
             # C_eff = MaxLeverage * Equity - GrossExposure
             C_eff = self.config.max_leverage * equity - gross_exposure
             C_eff_usd = C_eff * rate
-            max_margin_qty = self.commission_model.get_max_qty(C_eff_usd, price_eff_fx)
+            max_margin_qty = self._get_max_qty(C_eff_usd, price_eff_fx)
             q_limit = max_margin_qty
         else:
             q_limit = max_cash_qty
@@ -476,7 +503,7 @@ class Backtester:
         
         # Account for FX markup on transaction value by adjusting effective price
         price_eff_fx = price_eff / (1.0 - self.fx_pct)
-        max_short_qty = self.commission_model.get_max_qty(C_eff_usd, price_eff_fx)
+        max_short_qty = self._get_max_qty(C_eff_usd, price_eff_fx)
         return max(qty, -max_short_qty)
 
     # -----------------------------------------------------------------
@@ -536,7 +563,7 @@ class Backtester:
             return
             
         price_eff = self.slippage_model.apply(price, -qty)
-        comm = self.commission_model.calculate(-qty, price_eff)
+        comm = self._calculate_commission(-qty, price_eff)
         
         proceeds = self._calculate_liquidation_proceeds(qty, qty * price_eff, comm, rate)
         state.cash += proceeds
@@ -548,10 +575,8 @@ class Backtester:
     def _calculate_liquidation_proceeds(self, qty: float, val_usd: float, comm_usd: float, rate: float) -> float:
         if self.config.account_currency == 'USD':
             return val_usd - comm_usd
-        if qty > 0.0: # Sell long
-            val_account = val_usd / (rate * (1.0 + self.fx_pct))
-        else: # Buy to cover short
-            val_account = val_usd / (rate * (1.0 - self.fx_pct))
+        is_buy = qty < 0.0
+        val_account = self.currency_converter.convert_trade(val_usd, None, is_buy, rate)
         return val_account - comm_usd / rate
 
     def _finalize_results(self, cash_hist: np.ndarray, val_hist: np.ndarray, deposit_hist: np.ndarray) -> pd.DataFrame:

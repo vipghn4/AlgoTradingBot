@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from data_structures import Strategy
 from portfolio_state import PortfolioState
-from trading_models import DefaultCommissionModel, DefaultSlippageModel, DefaultTaxModel, UKTaxModel, USTaxModel
+from trading_models import DefaultCommissionModel, DefaultSlippageModel, DefaultTaxModel, UKTaxModel, USTaxModel, CurrencyConverter
 from backtester import Backtester
 
 class MockStrategy(Strategy):
@@ -17,15 +17,13 @@ class MockStrategy(Strategy):
 class TestCommissionModel(unittest.TestCase):
     """Unit tests for the Commission Model using Arrange-Act-Assert (AAA)."""
 
-    def test_commission_calculation_separates_broker_commission_from_fx_markup(self):
+    def test_commission_calculation_calculates_brokerage_fee(self):
         # Arrange
-        # per_share = 0, pct = 0.01, flat = 2.0, minimum = 0.0, fx_pct = 0.005
-        model = DefaultCommissionModel(per_share=0.0, pct=0.01, flat=2.0, minimum=0.0, fx_pct=0.005)
+        # per_share = 0.5, pct = 0.01, flat = 2.0, minimum = 0.0
+        model = DefaultCommissionModel(per_share=0.5, pct=0.01, flat=2.0, minimum=0.0)
         qty = 10.0
         price = 100.0
-        # broker_comm = 10 * 100 * 0.01 + 2.0 = 12.0
-        # fx_fee = 10 * 100 * 0.005 = 5.0
-        # total = max(12.0, 0.0) + 5.0 = 17.0
+        # broker_comm = 10 * 0.5 + 10 * 100 * 0.01 + 2.0 = 5.0 + 10.0 + 2.0 = 17.0
         expected_commission = 17.0
 
         # Act
@@ -34,21 +32,59 @@ class TestCommissionModel(unittest.TestCase):
         # Assert
         self.assertEqual(actual_commission, expected_commission)
 
-    def test_commission_enforces_minimum_fee_on_brokerage_only(self):
+    def test_commission_enforces_minimum_fee(self):
         # Arrange
-        model = DefaultCommissionModel(per_share=0.0, pct=0.0, flat=0.0, minimum=5.0, fx_pct=0.01)
+        model = DefaultCommissionModel(per_share=0.0, pct=0.0, flat=0.0, minimum=5.0)
         qty = 1.0
         price = 10.0
         # broker_comm = 0.0 -> clamped to minimum 5.0
-        # fx_fee = 1.0 * 10.0 * 0.01 = 0.1
-        # total = 5.0 + 0.1 = 5.1
-        expected_commission = 5.1
+        expected_commission = 5.0
 
         # Act
         actual_commission = model.calculate(qty, price)
 
         # Assert
         self.assertAlmostEqual(actual_commission, expected_commission)
+
+
+class TestCurrencyConverter(unittest.TestCase):
+    """Unit tests for the CurrencyConverter using Arrange-Act-Assert (AAA)."""
+
+    def test_convert_trade_applies_markup_correctly(self):
+        # Arrange
+        rates = pd.Series([1.25], index=[pd.Timestamp('2026-06-14')])
+        converter = CurrencyConverter(fx_rates=rates, fx_pct=0.005)
+        amount_usd = 1000.0
+        rate = 1.25
+
+        # Buy transaction: amount / (rate * (1 - fx_pct))
+        expected_buy = 1000.0 / (1.25 * (1.0 - 0.005))
+        
+        # Sell transaction: amount / (rate * (1 + fx_pct))
+        expected_sell = 1000.0 / (1.25 * (1.0 + 0.005))
+
+        # Act
+        actual_buy = converter.convert_trade(amount_usd, pd.Timestamp('2026-06-14'), is_buy=True, rate=rate)
+        actual_sell = converter.convert_trade(amount_usd, pd.Timestamp('2026-06-14'), is_buy=False, rate=rate)
+
+        # Assert
+        self.assertAlmostEqual(actual_buy, expected_buy)
+        self.assertAlmostEqual(actual_sell, expected_sell)
+
+    def test_convert_deposit_applies_markup_correctly(self):
+        # Arrange
+        rates = pd.Series([1.25], index=[pd.Timestamp('2026-06-14')])
+        converter = CurrencyConverter(fx_rates=rates, fx_pct=0.005)
+
+        # Act & Assert
+        # Case 1: Same currency -> no conversion
+        self.assertEqual(converter.convert_deposit(100.0, 'USD', 'USD', 1.25), 100.0)
+
+        # Case 2: GBP to USD -> amount * rate * (1 - fx_pct)
+        self.assertAlmostEqual(converter.convert_deposit(100.0, 'GBP', 'USD', 1.25), 124.375)
+
+        # Case 3: USD to GBP -> (amount / rate) * (1 - fx_pct)
+        self.assertAlmostEqual(converter.convert_deposit(100.0, 'USD', 'GBP', 1.25), 79.6)
 
 
 class TestSlippageModel(unittest.TestCase):

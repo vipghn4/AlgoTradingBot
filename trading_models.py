@@ -2,6 +2,32 @@ from abc import ABC, abstractmethod
 import pandas as pd
 from typing import Optional
 
+class CurrencyConverter:
+    """Handles currency conversions and applies FX markups exactly once."""
+
+    def __init__(self, fx_rates: pd.Series, fx_pct: float = 0.0):
+        self.fx_rates = fx_rates
+        self.fx_pct = fx_pct
+
+    def convert_trade(self, amount_usd: float, date: pd.Timestamp, is_buy: bool, rate: float) -> float:
+        """Convert trade transaction value from USD to account currency, applying FX fee."""
+        if self.fx_pct == 0.0:
+            return amount_usd / rate
+        if is_buy:
+            return amount_usd / (rate * (1.0 - self.fx_pct))
+        else:
+            return amount_usd / (rate * (1.0 + self.fx_pct))
+
+    def convert_deposit(self, amount: float, deposit_curr: str, account_curr: str, rate: float) -> float:
+        """Convert deposit from deposit currency to account base currency, applying FX fee."""
+        if deposit_curr == account_curr:
+            return amount
+        if deposit_curr == 'GBP' and account_curr == 'USD':
+            return amount * rate * (1.0 - self.fx_pct)
+        else:
+            return (amount / rate) * (1.0 - self.fx_pct)
+
+
 class CommissionModel(ABC):
     """Abstract base class representing transaction commission models."""
 
@@ -17,49 +43,45 @@ class CommissionModel(ABC):
 
 
 class DefaultCommissionModel(CommissionModel):
-    """Default commission model separating per-share, percentage, flat, and minimum commissions from FX markup."""
+    """Default commission model separating per-share, percentage, flat, and minimum commissions."""
 
-    def __init__(self, per_share: float = 0.0, pct: float = 0.0, flat: float = 0.0, minimum: float = 0.0, fx_pct: float = 0.0):
+    def __init__(self, per_share: float = 0.0, pct: float = 0.0, flat: float = 0.0, minimum: float = 0.0):
         """
-        Initialize the commission model with broker commission and FX markup settings.
+        Initialize the commission model with broker commission settings.
 
         Args:
             per_share: Fixed fee charged per individual share traded.
             pct: Percentage-based fee of the total transaction value.
             flat: Flat fixed fee charged per execution.
             minimum: Minimum brokerage commission threshold.
-            fx_pct: FX conversion markup percentage.
         """
         self.per_share = per_share
         self.pct = pct
         self.flat = flat
         self.minimum = minimum
-        self.fx_pct = fx_pct
 
     def calculate(self, qty: float, price: float) -> float:
-        """Calculate commission and FX markup for a specific trade."""
+        """Calculate commission for a specific trade."""
         if qty == 0.0:
             return 0.0
         broker_comm = (abs(qty) * self.per_share) + (abs(qty) * price * self.pct) + self.flat
-        fx_fee = abs(qty) * price * self.fx_pct
-        return max(broker_comm, self.minimum) + fx_fee
+        return max(broker_comm, self.minimum)
 
     def get_max_qty(self, cash: float, price: float) -> float:
         """Determine the maximum purchaseable quantity for a given cash limit."""
         if cash <= 0.0:
             return 0.0
         
-        # Cost equation: q * P * (1 + pct + fx_pct) + q * per_share + flat = cash
-        price_factor = price * (1.0 + self.pct + self.fx_pct) + self.per_share
+        # Cost equation: q * P * (1 + pct) + q * per_share + flat = cash
+        price_factor = price * (1.0 + self.pct) + self.per_share
         if price_factor > 0.0:
             q_candidate = (cash - self.flat) / price_factor
             broker_comm_candidate = q_candidate * (price * self.pct + self.per_share) + self.flat
             if broker_comm_candidate >= self.minimum:
                 q_max = q_candidate
             else:
-                # Minimum commission is active: cost = q * P * (1 + fx_pct) + minimum = cash
-                denominator = price * (1.0 + self.fx_pct)
-                q_max = (cash - self.minimum) / denominator if denominator > 0.0 else 0.0
+                # Minimum commission is active: cost = q * P + minimum = cash
+                q_max = (cash - self.minimum) / price if price > 0.0 else 0.0
         else:
             q_max = 0.0
             
