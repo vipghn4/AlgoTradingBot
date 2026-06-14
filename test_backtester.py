@@ -1,7 +1,8 @@
 import unittest
 import numpy as np
 import pandas as pd
-from backtester import DefaultCommissionModel, DefaultSlippageModel, DefaultTaxModel, PortfolioState
+from portfolio_state import PortfolioState
+from trading_models import DefaultCommissionModel, DefaultSlippageModel, DefaultTaxModel
 
 class TestCommissionModel(unittest.TestCase):
     """Unit tests for the Commission Model using Arrange-Act-Assert (AAA)."""
