@@ -37,7 +37,31 @@ class Backtester:
                  slippage_model: Optional[SlippageModel] = None,
                  tax_model: Optional[TaxModel] = None):
         """
-        A realistic backtester designed to model constraints faced by retail investors.
+        Initializes the Backtester with chronological market data and a trading strategy.
+
+        Args:
+            data: MultiIndex DataFrame containing historical prices level-indexed by (Ticker, Price).
+            strategy: The Strategy object generating trade signals.
+            initial_capital: Starting cash balance of the portfolio.
+            monthly_deposit: Periodic savings capital added to the cash balance monthly.
+            commission_per_share: Per-share fee charged by the broker on transactions.
+            commission_pct: Percentage-based fee of total transaction value.
+            commission_flat: Fixed flat fee per trade execution.
+            commission_min: Minimum transaction fee limit.
+            tax_rate: Capital gains tax rate applied on realized returns.
+            tax_deferred: If True, tax is compounded and deducted yearly; else paid on trade execution.
+            annual_margin_rate: Annual borrowing interest rate for negative cash balances.
+            annual_borrow_rate: Annual fee rate for carrying short positions.
+            allow_margin: If True, margin debt is allowed up to the max_leverage constraint.
+            max_leverage: Maximum allowed gross leverage (Gross Exposure / Net Equity).
+            allow_short: If True, short-selling positions can be opened.
+            allow_fractional: If True, fractional shares can be traded; else rounded to integers.
+            slippage_pct: Slippage rate representing average execution bid-ask spread friction.
+            execution_delay: Number of bars to delay the strategy signal (default 1).
+            execution_price_type: Pricing type to execute trades at ('Open' or 'Close').
+            commission_model: Optional custom CommissionModel policy implementation.
+            slippage_model: Optional custom SlippageModel policy implementation.
+            tax_model: Optional custom TaxModel policy implementation.
         """
         if not isinstance(data.columns, pd.MultiIndex):
             raise ValueError("Data columns must be a MultiIndex DataFrame with levels (Ticker, Price)")
@@ -62,6 +86,7 @@ class Backtester:
         self.tax_model = tax_model or DefaultTaxModel(rate=tax_rate, deferred=tax_deferred)
 
     def run(self) -> pd.DataFrame:
+        """Executes the backtest simulation over the entire historical dataset."""
         trades = self.strategy.generate_trades(self.data)
         
         # Ensure chronological index alignment and fill empty signals
@@ -94,6 +119,7 @@ class Backtester:
     # -----------------------------------------------------------------
     def _simulate(self, dates: pd.Index, trades_arr: np.ndarray, exec_prices_arr: np.ndarray,
                   close_prices_arr: np.ndarray, tickers: List[str], state: PortfolioState) -> pd.DataFrame:
+        """Runs the day-by-day simulation loop tracking equity, cash flows, and fees."""
                   
         cash_hist = np.zeros(len(dates), dtype=float)
         val_hist = np.zeros(len(dates), dtype=float)
@@ -124,6 +150,7 @@ class Backtester:
         return self._finalize_results(cash_hist, val_hist, deposit_hist)
 
     def _apply_daily_frictions(self, date: pd.Timestamp, state: PortfolioState, days_elapsed: int) -> float:
+        """Applies deposits, compounding margin interest, and year-end deferred tax deductions."""
         deposit_made = 0.0
         
         # Monthly deposit
@@ -148,6 +175,7 @@ class Backtester:
     def _process_row(self, date_idx: int, date: pd.Timestamp, trade_row_arr: np.ndarray,
                      state: PortfolioState, exec_prices_arr: np.ndarray, close_prices_arr: np.ndarray,
                      tickers: List[str], days_elapsed: int) -> float:
+        """Processes daily transactions (sells first, then buys) and returns portfolio valuation."""
                      
         # 1. Apply daily short borrow fees on all existing short positions
         for ticker_idx in range(len(tickers)):
@@ -176,6 +204,7 @@ class Backtester:
         return np.nansum(state.holdings * close_prices_arr[date_idx])
 
     def _apply_borrow_fee(self, ticker_idx: int, price: float, state: PortfolioState, days_elapsed: int):
+        """Deducts the calendar short borrow fee based on position value and elapsed days."""
         short_val = abs(state.holdings[ticker_idx] * price)
         state.cash -= short_val * self.borrow_rate_daily * days_elapsed
 
@@ -184,6 +213,7 @@ class Backtester:
     # -----------------------------------------------------------------
     def _execute_trade(self, date_idx: int, ticker_idx: int, qty: float, price: float,
                        state: PortfolioState, close_prices_arr: np.ndarray):
+        """Checks constraints, calculates costs/taxes, and executes a single asset transaction."""
                        
         price_eff = self.slippage_model.apply(price, qty)
         
@@ -231,6 +261,7 @@ class Backtester:
 
     def _clamp_buy_quantity(self, date_idx: int, ticker_idx: int, qty: float, price_eff: float,
                             state: PortfolioState, close_prices_arr: np.ndarray) -> float:
+        """Clamps requested purchase quantity based on available cash and margin limits."""
                             
         max_cash_qty = self.commission_model.get_max_qty(state.cash, price_eff)
         
@@ -251,9 +282,7 @@ class Backtester:
 
     def _clamp_short_quantity(self, date_idx: int, qty: float, price_eff: float,
                               state: PortfolioState, close_prices_arr: np.ndarray) -> float:
-        # Short entries require margin collateral.
-        # Net Equity = Cash + NetHoldings. Gross Exposure = GrossHoldings + abs(qty)*P
-        # Required Margin Check: Gross Exposure / Net Equity <= MaxLeverage
+        """Clamps requested short sell quantity to prevent margin leverage limit violations."""
         
         net_holdings_val = np.nansum(state.holdings * close_prices_arr[date_idx])
         equity = state.cash + net_holdings_val
@@ -268,6 +297,7 @@ class Backtester:
         return max(qty, -max_short_qty)  # qty and max_short_qty are negative/bounds
 
     def _update_accounting(self, ticker_idx: int, qty: float, price: float, comm: float, state: PortfolioState):
+        """Updates portfolio holdings count and recalculates the average cost basis per share."""
         old_h = state.holdings[ticker_idx]
         new_h = old_h + qty
         
@@ -295,6 +325,7 @@ class Backtester:
         state.holdings[ticker_idx] = new_h
 
     def _finalize_results(self, cash_hist: np.ndarray, val_hist: np.ndarray, deposit_hist: np.ndarray) -> pd.DataFrame:
+        """Formats the simulated historical timelines into a final output DataFrame with net returns."""
         res = pd.DataFrame(index=self.data.index)
         res['cash'] = cash_hist
         res['holdings_value'] = val_hist
