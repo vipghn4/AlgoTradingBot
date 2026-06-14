@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from typing import Optional
 from backtester import Backtester
 from data_structures import Strategy
 
@@ -13,10 +14,14 @@ class PerformanceAnalyzer:
         self.risk_free_rate = risk_free_rate
         self.metrics = {}
 
-    def analyze(self):
+    def analyze(self, save_path: Optional[str] = None) -> plt.Figure:
         """Public entry point for full analysis."""
         self._calculate_all_metrics()
-        self.plot_performance()
+        fig = self.plot_performance()
+        if save_path:
+            fig.savefig(save_path)
+            plt.close(fig)
+        return fig
 
     def _calculate_all_metrics(self):
         """Orchestrates the calculation of all metric groups."""
@@ -52,16 +57,57 @@ class PerformanceAnalyzer:
         return {"Max Drawdown": f"{drawdowns.min():.2%}"}
 
     def _get_activity_metrics(self) -> dict:
-        trades_df = self.strategy.generate_trades(self.data)
-        count = (trades_df != 0).sum().sum()
+        count = self.backtester.state.executed_trades_count if hasattr(self.backtester, 'state') else 0
         return {"Total Trades": int(count)}
 
-    def plot_performance(self):
+    def plot_performance(self) -> plt.Figure:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
         self._plot_benchmarks(ax1)
         self._plot_equity_curve(ax2)
         plt.tight_layout()
-        plt.show()
+        return fig
+
+    @classmethod
+    def plot_comparison(cls, analyzers: dict) -> plt.Figure:
+        """
+        Generates a consolidated comparison plot of equity curves and drawdowns
+        across multiple PerformanceAnalyzer instances.
+        """
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        
+        # Subplot 1: Absolute Equity Curve Comparison
+        for name, analyzer in analyzers.items():
+            ax1.plot(analyzer.portfolio_results['total_equity'], label=name, alpha=0.8)
+            
+        # Plot Cumulative Invested Capital as a baseline using parameters from the first analyzer
+        if analyzers:
+            first_analyzer = next(iter(analyzers.values()))
+            market_data = first_analyzer.data
+            is_new_month = market_data.index.to_series().dt.to_period('M') != market_data.index.to_series().shift(1).dt.to_period('M')
+            config = first_analyzer.backtester.config
+            initial_usd = config.initial_capital
+            monthly_usd = config.monthly_deposit * config.deposit_fx_rate
+            invested_capital = (is_new_month.astype(float) * monthly_usd).cumsum() + initial_usd
+            ax1.plot(invested_capital, label='Cumulative Invested Capital', color='black', linestyle='--', alpha=0.7)
+            
+        ax1.set_title('Portfolio Equity Comparison ($ USD)')
+        ax1.set_ylabel('Total Value ($)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Subplot 2: Under-water Drawdown Comparison
+        for name, analyzer in analyzers.items():
+            rolling_max = analyzer.portfolio_results['total_equity'].cummax()
+            drawdowns = (analyzer.portfolio_results['total_equity'] - rolling_max) / rolling_max
+            ax2.plot(drawdowns * 100.0, label=name, alpha=0.8)
+            
+        ax2.set_title('Portfolio Drawdown Comparison (%)')
+        ax2.set_ylabel('Drawdown %')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
 
     def _plot_benchmarks(self, ax):
         tickers = self.data.columns.get_level_values(0).unique()
@@ -76,6 +122,6 @@ class PerformanceAnalyzer:
         ax.plot(self.portfolio_results['total_equity'], color='green', label='Strategy Equity')
         ax.set_title('Portfolio Equity Curve (Net of Fees & Taxes)')
         ax.fill_between(self.portfolio_results.index, self.portfolio_results['total_equity'],
-                         self.backtester.initial_capital, alpha=0.1, color='green')
+                         self.backtester.config.initial_capital, alpha=0.1, color='green')
         ax.legend()
         ax.grid(True, alpha=0.3)
