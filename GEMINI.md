@@ -137,6 +137,7 @@ Minimize human resources required to build and maintain the system by creating a
 
 ### Coding principles for class & functions
 #### Function principles
+- **Assertion on input arguments**: Always put assertion on the validity of input arguments to prevent function misuses.
 - **Be ridiculously small**:
    - A function should rarely be more than 20 lines long, and ideally under 10 lines.
    - Indent levels inside a function (like if, else, or while blocks) should not be greater than one or two levels deep.

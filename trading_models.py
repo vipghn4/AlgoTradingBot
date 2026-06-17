@@ -167,6 +167,10 @@ class TaxModel(ABC):
         """Reset stateful trackers if any."""
         pass
 
+    def _validate_realized_lots(self, realized_lots: list):
+        """Validate that all matched transaction lots have non-negative quantities."""
+        assert all(lot[0] >= 0.0 for lot in realized_lots), "Lot quantity must be non-negative."
+
 
 class DefaultTaxModel(TaxModel):
     """Default tax model calculating capital gains and losses on long and short liquidations."""
@@ -194,6 +198,7 @@ class DefaultTaxModel(TaxModel):
 
     def calculate_realized_gain(self, realized_lots: list, comm: float, rate: float = 1.0) -> float:
         """Calculate the net realized capital gains from matched tax lots converted to the account currency."""
+        self._validate_realized_lots(realized_lots)
         # Convert USD gain to account currency using the disposal rate
         gain_usd = sum(qty * (sell_p - buy_p) for qty, buy_p, buy_rate, sell_p, sell_rate, days in realized_lots)
         return gain_usd / rate
@@ -235,6 +240,7 @@ class UKTaxModel(TaxModel):
         return 0.0
 
     def calculate_realized_gain(self, realized_lots: list, comm: float, rate: float = 1.0) -> float:
+        self._validate_realized_lots(realized_lots)
         # UK HMRC rules require converting purchase price using purchase-date rate and sale price using sale-date rate
         return sum(qty * (sell_p / sell_rate - buy_p / buy_rate) for qty, buy_p, buy_rate, sell_p, sell_rate, days in realized_lots)
 
@@ -283,6 +289,7 @@ class USTaxModel(TaxModel):
         return 0.0
 
     def calculate_realized_gain(self, realized_lots: list, comm: float, rate: float = 1.0) -> float:
+        self._validate_realized_lots(realized_lots)
         net_gain_account = 0.0
         for qty, buy_p, buy_rate, sell_p, sell_rate, days in realized_lots:
             # US IRS cost basis and proceeds are converted using acquisition-date rate and disposal-date rate
@@ -344,6 +351,7 @@ class TaxFreeModel(TaxModel):
         return 0.0
 
     def calculate_realized_gain(self, realized_lots: list, comm: float, rate: float = 1.0) -> float:
+        self._validate_realized_lots(realized_lots)
         return 0.0
 
     def calculate_annual_tax(self, realized_gain_ytd: float, tax_loss_carry_forward: float) -> tuple[float, float]:

@@ -429,5 +429,50 @@ class TestUSTaxModel(unittest.TestCase):
         self.assertEqual(new_carry, 0.0)
 
 
+class TestMarginRiskTiming(unittest.TestCase):
+    """Unit tests verifying margin risk controls execution timing and liquidation logic."""
+
+    def test_close_price_execution_does_not_trigger_false_intraday_liquidation(self):
+        # Arrange
+        # Day 0: Open=100, High=100, Low=50, Close=100.
+        # This has a massive intraday drop, but the user is buying at the Close.
+        # They should not be liquidated because they did not hold the position during the day.
+        dates = pd.date_range(start='2026-06-01', periods=1, freq='D')
+        columns = pd.MultiIndex.from_tuples([
+            ('ABC', 'Open'), ('ABC', 'High'), ('ABC', 'Low'), ('ABC', 'Close')
+        ], names=['Ticker', 'Price'])
+        data = pd.DataFrame(100.0, index=dates, columns=columns)
+        data.loc[dates[0], ('ABC', 'Low')] = 50.0  # Big intraday drop
+        
+        signals = pd.DataFrame(0.0, index=data.index, columns=['ABC'])
+        signals.iloc[0] = 10.0  # Buy 10 shares
+        strategy = MockStrategy(signals)
+        
+        # Configure with max leverage 2.0, maintenance margin 25%, Close execution
+        tester = Backtester(
+            data=data,
+            strategy=strategy,
+            initial_capital=1000.0,
+            monthly_deposit=0.0,
+            allow_margin=True,
+            max_leverage=2.0,
+            maintenance_margin_pct=0.25,
+            slippage_pct=0.0,
+            execution_delay=0,  # Execute on same day
+            execution_price_type='Close'
+        )
+        
+        # Act
+        results = tester.run()
+        
+        # Assert
+        # They should successfully buy 10 shares without triggering liquidation
+        self.assertFalse(tester.state.is_liquidated)
+        self.assertEqual(tester.state.holdings[0], 10.0)
+        # Cash should be 1000 - 10 * 100 = 0.0
+        self.assertAlmostEqual(results['cash'].iloc[0], 0.0)
+        self.assertAlmostEqual(results['holdings_value'].iloc[0], 1000.0)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -33,6 +33,15 @@ class BacktesterConfig:
     deposit_currency: str
 
 
+@dataclass(frozen=True)
+class SimulationContext:
+    tickers: List[str]
+    exec_prices: np.ndarray
+    close_prices: np.ndarray
+    low_prices: Optional[np.ndarray]
+    high_prices: Optional[np.ndarray]
+
+
 # =====================================================================
 # CORE BACKTESTER ENGINE
 # =====================================================================
@@ -235,14 +244,20 @@ class Backtester:
         )
         self.state = state
         
-        return self._simulate(trades.index, trades.to_numpy(), exec_prices, close_prices, df_low, df_high, tickers, state)
+        ctx = SimulationContext(
+            tickers=tickers,
+            exec_prices=exec_prices,
+            close_prices=close_prices,
+            low_prices=df_low,
+            high_prices=df_high
+        )
+        
+        return self._simulate(trades.index, trades.to_numpy(), state, ctx)
 
     # -----------------------------------------------------------------
     # Simulation Logic Loop
     # -----------------------------------------------------------------
-    def _simulate(self, dates: pd.Index, trades_arr: np.ndarray, exec_prices_arr: np.ndarray,
-                  close_prices_arr: np.ndarray, low_prices_arr: Optional[np.ndarray],
-                  high_prices_arr: Optional[np.ndarray], tickers: List[str], state: PortfolioState) -> pd.DataFrame:
+    def _simulate(self, dates: pd.Index, trades_arr: np.ndarray, state: PortfolioState, ctx: SimulationContext) -> pd.DataFrame:
         """Runs the day-by-day simulation loop tracking equity, cash flows, and fees."""
                   
         cash_hist = np.zeros(len(dates), dtype=float)
@@ -258,11 +273,16 @@ class Backtester:
             deposit_made = self._apply_daily_frictions(date, state, days_elapsed, rate)
             deposit_hist[i] = deposit_made
             
-            # Execute transactions
-            daily_val_usd = self._process_row(i, date, trades_arr[i], state, exec_prices_arr, close_prices_arr, tickers, days_elapsed, rate)
+            # Reset liquidation flag for the new day
+            state.is_liquidated = False
             
-            # Maintenance margin & liquidation check
-            self._check_maintenance_margin(i, state, close_prices_arr, low_prices_arr, high_prices_arr, tickers, rate)
+            if self.config.execution_price_type == 'Open':
+                daily_val_usd = self._simulate_open_day(i, date, trades_arr[i], state, ctx, days_elapsed, rate)
+            else:
+                daily_val_usd = self._simulate_close_day(i, date, trades_arr[i], state, ctx, days_elapsed, rate)
+                    
+            if state.is_liquidated:
+                daily_val_usd = 0.0
             
             cash_hist[i] = state.cash
             val_hist[i] = daily_val_usd / rate
@@ -278,6 +298,23 @@ class Backtester:
                 cash_hist[-1] = state.cash
                 
         return self._finalize_results(cash_hist, val_hist, deposit_hist)
+
+    def _simulate_open_day(self, idx: int, date: pd.Timestamp, trade_row: np.ndarray, state: PortfolioState,
+                           ctx: SimulationContext, days_elapsed: int, rate: float) -> float:
+        """Process Open-price trade execution and post-trade margin checking for a single day."""
+        daily_val_usd = self._process_row(idx, date, trade_row, state, ctx.exec_prices, ctx.close_prices, ctx.tickers, days_elapsed, rate)
+        self._check_maintenance_margin(idx, state, ctx.close_prices, ctx.low_prices, ctx.high_prices, ctx.tickers, rate)
+        return daily_val_usd
+
+    def _simulate_close_day(self, idx: int, date: pd.Timestamp, trade_row: np.ndarray, state: PortfolioState,
+                            ctx: SimulationContext, days_elapsed: int, rate: float) -> float:
+        """Process pre-trade margin check, Close-price trade execution, and Close margin verification for a single day."""
+        self._check_maintenance_margin(idx, state, ctx.close_prices, ctx.low_prices, ctx.high_prices, ctx.tickers, rate)
+        if not state.is_liquidated:
+            daily_val_usd = self._process_row(idx, date, trade_row, state, ctx.exec_prices, ctx.close_prices, ctx.tickers, days_elapsed, rate)
+            self._check_close_margin(idx, state, ctx.close_prices, ctx.tickers, rate)
+            return daily_val_usd
+        return 0.0
 
     def _apply_daily_frictions(self, date: pd.Timestamp, state: PortfolioState, days_elapsed: int, rate: float) -> float:
         """Applies deposits, compounding margin interest, and year-end deferred tax deductions."""
@@ -553,6 +590,7 @@ class Backtester:
 
     def _liquidate_portfolio(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray, tickers: List[str], rate: float):
         """Forcibly liquidates all open positions at Close prices due to margin call."""
+        state.is_liquidated = True
         date = self.data.index[date_idx]
         for ticker_idx in range(len(tickers)):
             qty = state.holdings[ticker_idx]
