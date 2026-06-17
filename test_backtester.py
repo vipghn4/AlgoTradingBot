@@ -86,6 +86,16 @@ class TestCurrencyConverter(unittest.TestCase):
         # Case 3: USD to GBP -> (amount / rate) * (1 - fx_pct)
         self.assertAlmostEqual(converter.convert_deposit(100.0, 'USD', 'GBP', 1.25), 79.6)
 
+        # Case 4: EUR to USD (Arbitrary pair with USD account) -> amount * rate * (1 - fx_pct)
+        self.assertAlmostEqual(converter.convert_deposit(100.0, 'EUR', 'USD', 1.10), 109.45)
+
+        # Case 5: USD to EUR (Arbitrary pair with USD deposit) -> (amount / rate) * (1 - fx_pct)
+        self.assertAlmostEqual(converter.convert_deposit(100.0, 'USD', 'EUR', 1.10), 90.45454545)
+
+        # Case 6: EUR to GBP (No USD involved) -> raises ValueError
+        with self.assertRaises(ValueError):
+            converter.convert_deposit(100.0, 'EUR', 'GBP', 0.85)
+
 
 class TestSlippageModel(unittest.TestCase):
     """Unit tests for the Slippage Model using Arrange-Act-Assert (AAA)."""
