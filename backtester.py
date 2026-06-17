@@ -78,13 +78,16 @@ class Backtester:
             commission_flat: Fixed flat fee per trade execution.
             commission_min: Minimum transaction fee limit.
             fx_pct: FX conversion fee markup percentage (e.g. 0.0035 for 0.35%).
+                - Reference: https://wise.com/in/blog/what-is-a-forex-markup-fee
             tax_rate: Capital gains tax rate applied on realized returns.
             tax_deferred: If True, tax is compounded and deducted yearly; else paid on trade execution.
             annual_margin_rate: Annual borrowing interest rate for negative cash balances.
             annual_borrow_rate: Annual fee rate for carrying short positions.
             allow_margin: If True, margin debt is allowed up to the max_leverage constraint.
             max_leverage: Maximum allowed gross leverage (Gross Exposure / Net Equity).
+                - Reference: https://corporatefinanceinstitute.com/resources/accounting/leverage-ratios/
             maintenance_margin_pct: Minimum margin equity ratio below which liquidation occurs.
+                - Reference: https://www.benzinga.com/money/what-margin-equity
             allow_short: If True, short-selling positions can be opened.
             allow_fractional: If True, fractional shares can be traded; else rounded to integers.
             slippage_pct: Slippage rate representing average execution bid-ask spread friction.
@@ -198,9 +201,7 @@ class Backtester:
     def run(self) -> pd.DataFrame:
         """Executes the backtest simulation over the entire historical dataset."""
         trades = self.strategy.generate_trades(self.data)
-        
-        # Ensure chronological index alignment and fill empty signals
-        trades = trades.reindex(self.data.index, fill_value=0.0)
+        assert all(trades.index == self.data.index), "Trade signals index must match data index."
 
         # Apply execution signal delay
         if self.config.execution_delay > 0:
@@ -525,6 +526,7 @@ class Backtester:
 
     def _check_intraday_margin(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray,
                                low_prices_arr: np.ndarray, high_prices_arr: np.ndarray, tickers: List[str], rate: float):
+        """Checks for maintenance margin violations using intraday Low/High prices to prevent liquidation delay."""
         worst_prices = np.zeros(len(tickers))
         for j in range(len(tickers)):
             worst_prices[j] = low_prices_arr[date_idx, j] if state.holdings[j] >= 0.0 else high_prices_arr[date_idx, j]
@@ -540,6 +542,7 @@ class Backtester:
 
     def _check_close_margin(self, date_idx: int, state: PortfolioState, close_prices_arr: np.ndarray,
                             tickers: List[str], rate: float):
+        """Checks for maintenance margin violations using Close prices at end of day."""
         equity = state.get_equity(close_prices_arr[date_idx], rate)
         gross_exposure = state.get_gross_exposure(close_prices_arr[date_idx], rate)
         
@@ -558,6 +561,7 @@ class Backtester:
 
     def _liquidate_ticker(self, date_idx: int, ticker_idx: int, qty: float, date: pd.Timestamp,
                           state: PortfolioState, close_prices_arr: np.ndarray, rate: float):
+        """Liquidates a single ticker position at Close price, updating cash and realized gains/losses."""
         price = close_prices_arr[date_idx, ticker_idx]
         if pd.isna(price) or price <= 0.0:
             return
@@ -573,6 +577,24 @@ class Backtester:
         state.realized_gain_loss_ytd += trade_gain
 
     def _calculate_liquidation_proceeds(self, qty: float, val_usd: float, comm_usd: float, rate: float) -> float:
+        """Calculates the net proceeds from liquidating a position, accounting for FX conversion and commission.
+
+        Terms:
+        - Proceeds: The net cash received from closing a position after deducting commissions and converting to account currency.
+
+        Args:
+        - qty: The quantity of the position being liquidated (positive for long, negative for short).
+            - qty < 0 indicates a short position being closed (buying back shares).
+            - qty > 0 indicates a long position being closed (selling shares).
+        - rate: The FX conversion rate from USD to account currency (account_currency / USD).
+
+        High-level process:
+        1. Calculate the gross liquidation value in USD (val_usd).
+        2. Subtract the commission in USD (comm_usd).
+        3. If the account currency is not USD, convert the net proceeds to account currency using the provided FX rate.
+        4. Return the net proceeds in account currency.
+        
+        Reference: https://legal-resources.uslegalforms.com/l/liquidation-proceeds"""
         if self.config.account_currency == 'USD':
             return val_usd - comm_usd
         is_buy = qty < 0.0

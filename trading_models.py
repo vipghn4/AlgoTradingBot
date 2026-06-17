@@ -10,7 +10,19 @@ class CurrencyConverter:
         self.fx_pct = fx_pct
 
     def convert_trade(self, amount_usd: float, date: pd.Timestamp, is_buy: bool, rate: float) -> float:
-        """Convert trade transaction value from USD to account currency, applying FX fee."""
+        """Convert trade transaction value from USD to account currency, applying FX fee.
+
+        Terms:
+        - Effective FX rate: The actual conversion rate after applying the FX markup fee.
+        
+        High-level logic:
+        1. If the account currency is USD, return the amount unchanged.
+        2. If the account currency is not USD, apply the FX conversion rate for the given date.
+        3. Apply the FX markup fee based on whether it's a buy or sell transaction.
+            3.1. For buy transactions, the effective rate is increased by the FX fee percentage.
+            3.2. For sell transactions, the effective rate is decreased by the FX fee percentage.
+        4. Return the converted amount in account currency.
+        """
         if self.fx_pct == 0.0:
             return amount_usd / rate
         if is_buy:
@@ -19,7 +31,14 @@ class CurrencyConverter:
             return amount_usd / (rate * (1.0 + self.fx_pct))
 
     def convert_deposit(self, amount: float, deposit_curr: str, account_curr: str, rate: float) -> float:
-        """Convert deposit from deposit currency to account base currency, applying FX fee."""
+        """Convert deposit from deposit currency to account base currency, applying FX fee.
+        
+        High-level logic:
+        1. If the deposit currency is the same as the account currency, return the amount unchanged.
+        2. If the deposit currency is GBP and the account currency is USD, apply the FX conversion rate and deduct the FX fee percentage.
+        3. For other currency pairs, apply the FX conversion rate and deduct the FX fee percentage.
+        4. Return the converted deposit amount in account currency.
+        """
         if deposit_curr == account_curr:
             return amount
         if deposit_curr == 'GBP' and account_curr == 'USD':
@@ -89,7 +108,9 @@ class DefaultCommissionModel(CommissionModel):
 
 
 class SlippageModel(ABC):
-    """Abstract base class representing transaction price slippage models."""
+    """Abstract base class representing transaction price slippage models.
+    
+    Reference: https://www.investopedia.com/terms/s/slippage.asp"""
 
     @abstractmethod
     def apply(self, price: float, qty: float) -> float:
